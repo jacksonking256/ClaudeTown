@@ -907,24 +907,40 @@ async function generatePlan(
     messages: [{ role: 'user', content: planning.dailyAgendaPrompt(anchor, id.name, planId) }],
     max_tokens: 300,
   });
-  const { content: scheduleRaw } = await chatCompletion({
-    messages: [
-      { role: 'user', content: planning.schedulePrompt(anchor, id.name, agenda, cfg.blockMinutes) },
-    ],
-    max_tokens: 1200,
+  const schedulePromptText = planning.schedulePrompt(anchor, id.name, agenda, cfg.blockMinutes);
+  const safeParse = (raw: string): planning.PlanBlock[] => {
+    try {
+      return planning.parseSchedule(extractJSON(raw));
+    } catch {
+      return [];
+    }
+  };
+  const first = await chatCompletion({
+    messages: [{ role: 'user', content: schedulePromptText }],
+    max_tokens: 2000,
   });
-  let blocks: planning.PlanBlock[];
-  try {
-    blocks = planning.parseSchedule(extractJSON(scheduleRaw));
-  } catch (e) {
-    console.error('[planning] could not parse schedule', e);
-    return [];
+  let blocks = safeParse(first.content);
+  if (blocks.length === 0) {
+    // One cheap retry with a stricter reminder before giving up.
+    const retry = await chatCompletion({
+      messages: [
+        { role: 'user', content: schedulePromptText },
+        { role: 'assistant', content: first.content },
+        { role: 'user', content: planning.scheduleRetryPrompt() },
+      ],
+      max_tokens: 2000,
+    });
+    blocks = safeParse(retry.content);
   }
   if (fromMinute !== undefined) {
     blocks = blocks.filter((b) => b.endMinute > fromMinute);
   }
-  if (blocks.length === 0) return [];
 
+  // Persist the attempt regardless of success: writing planMeta records that we
+  // tried today, so a failed parse falls back to random activities for the rest
+  // of the day instead of re-calling the LLM on every single tick (the cause of
+  // the error spam + wasted tokens). Block memories are written only when we got
+  // a usable schedule.
   const agendaEmbedding = (await fetchEmbedding(agenda)).embedding;
   const withEmbeddings = await asyncMap(blocks, async (b) => ({
     ...b,
@@ -940,6 +956,11 @@ async function generatePlan(
     fromMinute,
     blocks: withEmbeddings,
   });
+  if (blocks.length === 0) {
+    console.warn(
+      `[planning] no parseable schedule for ${id.name}; using random activities today`,
+    );
+  }
   return blocks;
 }
 
@@ -961,6 +982,9 @@ export async function ensureDayPlan(
       emoji: b.emoji,
     }));
   }
+  // A plan-control row with no blocks means we already tried (and failed) to
+  // build a schedule today — don't re-call the LLM every tick; just fall back.
+  if (state.meta) return [];
   return await generatePlan(ctx, worldId, playerId, planId);
 }
 
