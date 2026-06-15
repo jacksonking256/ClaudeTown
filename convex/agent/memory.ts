@@ -7,6 +7,15 @@ import { asyncMap } from '../util/asyncMap';
 import { GameId, agentId, conversationId, playerId } from '../aiTown/ids';
 import { SerializedPlayer } from '../aiTown/player';
 import { memoryFields } from './schema';
+import {
+  retrievalWeights,
+  recencyDecayPerHour,
+  retrievalAugment,
+  importanceDefault,
+  IMPORTANCE_MIN,
+  IMPORTANCE_MAX,
+  reflection as reflectionCfg,
+} from './cognitionConfig';
 
 // How long to wait before updating a memory's last access time.
 export const MEMORY_ACCESS_THROTTLE = 300_000; // In ms
@@ -65,7 +74,7 @@ export async function rememberConversation(
   const description = `Conversation with ${otherPlayer.name} at ${new Date(
     data.conversation._creationTime,
   ).toLocaleString()}: ${content}`;
-  const importance = await calculateImportance(description);
+  const importance = await calculateImportance(ctx, description);
   const { embedding } = await fetchEmbedding(description);
   authors.delete(player.id as GameId<'players'>);
   await ctx.runMutation(selfInternal.insertMemory, {
@@ -167,6 +176,7 @@ export async function searchMemories(
     limit: n * MEMORY_OVERFETCH,
   });
   const rankedMemories = await ctx.runMutation(selfInternal.rankAndTouchMemories, {
+    playerId,
     candidates,
     n,
   });
@@ -181,41 +191,87 @@ function makeRange(values: number[]) {
 
 function normalize(value: number, range: readonly [number, number]) {
   const [min, max] = range;
+  // Degenerate range (all equal, or no values) -> neutral 0 so the factor
+  // contributes nothing rather than NaN.
+  if (!Number.isFinite(min) || !Number.isFinite(max) || max === min) return 0;
   return (value - min) / (max - min);
 }
 
+// Three-factor retrieval (Stanford §4.1): score each candidate by a weighted,
+// normalized sum of recency (exponential decay since last access), importance
+// (poignancy), and relevance (embedding cosine similarity). Weights and decay
+// are config-driven. We also fold in the most recent and most important
+// memories so salient-but-less-relevant ones aren't missed by vector search.
 export const rankAndTouchMemories = internalMutation({
   args: {
+    playerId,
     candidates: v.array(v.object({ _id: v.id('memoryEmbeddings'), _score: v.number() })),
     n: v.number(),
   },
   handler: async (ctx, args) => {
     const ts = Date.now();
-    const relatedMemories = await asyncMap(args.candidates, async ({ _id }) => {
+    const weights = retrievalWeights();
+    const decay = recencyDecayPerHour();
+    const augment = retrievalAugment();
+
+    // Relevance comes only from vector search; key it by memory id.
+    const relevanceById = new Map<string, number>();
+    const byId = new Map<string, Doc<'memories'>>();
+    await asyncMap(args.candidates, async ({ _id, _score }) => {
       const memory = await ctx.db
         .query('memories')
         .withIndex('embeddingId', (q) => q.eq('embeddingId', _id))
         .first();
       if (!memory) throw new Error(`Memory for embedding ${_id} not found`);
-      return memory;
+      byId.set(memory._id, memory);
+      relevanceById.set(memory._id, _score);
     });
 
-    // TODO: fetch <count> recent memories and <count> important memories
-    // so we don't miss them in case they were a little less relevant.
-    const recencyScore = relatedMemories.map((memory) => {
+    // Augment with recent + important memories (no vector relevance score).
+    if (augment.recent > 0) {
+      const recent = await ctx.db
+        .query('memories')
+        .withIndex('playerId', (q) => q.eq('playerId', args.playerId))
+        .order('desc')
+        .take(augment.recent);
+      for (const m of recent) if (!byId.has(m._id)) byId.set(m._id, m);
+    }
+    if (augment.important > 0) {
+      const important = await ctx.db
+        .query('memories')
+        .withIndex('playerId_importance', (q) => q.eq('playerId', args.playerId))
+        .order('desc')
+        .take(augment.important);
+      for (const m of important) if (!byId.has(m._id)) byId.set(m._id, m);
+    }
+
+    const memories = [...byId.values()];
+    if (memories.length === 0) return [];
+
+    const recencyScore = memories.map((memory) => {
       const hoursSinceAccess = (ts - memory.lastAccess) / 1000 / 60 / 60;
-      return 0.99 ** Math.floor(hoursSinceAccess);
+      return decay ** Math.floor(Math.max(0, hoursSinceAccess));
     });
-    const relevanceRange = makeRange(args.candidates.map((c) => c._score));
-    const importanceRange = makeRange(relatedMemories.map((m) => m.importance));
+    // Relevance range is computed over vector scores; augmented memories with no
+    // score fall to the bottom (normalized 0) instead of being dropped.
+    const relevanceValues = [...relevanceById.values()];
+    const relevanceRange = makeRange(relevanceValues);
+    const relevanceMin = relevanceValues.length ? Math.min(...relevanceValues) : 0;
+    const importanceRange = makeRange(memories.map((m) => m.importance));
     const recencyRange = makeRange(recencyScore);
-    const memoryScores = relatedMemories.map((memory, idx) => ({
-      memory,
-      overallScore:
-        normalize(args.candidates[idx]._score, relevanceRange) +
-        normalize(memory.importance, importanceRange) +
-        normalize(recencyScore[idx], recencyRange),
-    }));
+
+    const memoryScores = memories.map((memory, idx) => {
+      const relevance = relevanceById.has(memory._id)
+        ? relevanceById.get(memory._id)!
+        : relevanceMin;
+      return {
+        memory,
+        overallScore:
+          weights.relevance * normalize(relevance, relevanceRange) +
+          weights.importance * normalize(memory.importance, importanceRange) +
+          weights.recency * normalize(recencyScore[idx], recencyRange),
+      };
+    });
     memoryScores.sort((a, b) => b.overallScore - a.overallScore);
     const accessed = memoryScores.slice(0, args.n);
     await asyncMap(accessed, async ({ memory }) => {
@@ -243,18 +299,24 @@ export const loadMessages = internalQuery({
   },
 });
 
-async function calculateImportance(description: string) {
+// Importance / poignancy scoring (Stanford §4.2), 1..10. Computed by a cheap
+// chat call at write time and cached by text hash so it is never recomputed.
+async function calculateImportance(ctx: ActionCtx, description: string): Promise<number> {
+  const textHash = await hashText(description);
+  const cached = await ctx.runQuery(selfInternal.getCachedImportance, { textHash });
+  if (cached !== null) return cached;
+
   const { content: importanceRaw } = await chatCompletion({
     messages: [
       {
         role: 'user',
-        content: `On the scale of 0 to 9, where 0 is purely mundane (e.g., brushing teeth, making bed) and 9 is extremely poignant (e.g., a break up, college acceptance), rate the likely poignancy of the following piece of memory.
+        content: `On the scale of ${IMPORTANCE_MIN} to ${IMPORTANCE_MAX}, where ${IMPORTANCE_MIN} is purely mundane (e.g., brushing teeth, making bed) and ${IMPORTANCE_MAX} is extremely poignant (e.g., a break up, college acceptance), rate the likely poignancy of the following piece of memory.
       Memory: ${description}
-      Answer on a scale of 0 to 9. Respond with number only, e.g. "5"`,
+      Answer on a scale of ${IMPORTANCE_MIN} to ${IMPORTANCE_MAX}. Respond with number only, e.g. "5"`,
       },
     ],
     temperature: 0.0,
-    max_tokens: 1,
+    max_tokens: 4,
   });
 
   let importance = parseFloat(importanceRaw);
@@ -263,10 +325,51 @@ async function calculateImportance(description: string) {
   }
   if (isNaN(importance)) {
     console.debug('Could not parse memory importance from: ', importanceRaw);
-    importance = 5;
+    importance = importanceDefault();
   }
+  importance = Math.max(IMPORTANCE_MIN, Math.min(IMPORTANCE_MAX, importance));
+  await ctx.runMutation(selfInternal.setCachedImportance, { textHash, importance });
   return importance;
 }
+
+async function hashText(text: string): Promise<ArrayBuffer> {
+  const buf = new TextEncoder().encode(text);
+  if (typeof crypto === 'undefined') {
+    const f = () => 'node:crypto';
+    const nodeCrypto = (await import(f())) as typeof import('crypto');
+    const hash = nodeCrypto.createHash('sha256');
+    hash.update(buf);
+    return hash.digest().buffer;
+  }
+  return await crypto.subtle.digest('SHA-256', buf);
+}
+
+export const getCachedImportance = internalQuery({
+  args: { textHash: v.bytes() },
+  handler: async (ctx, args): Promise<number | null> => {
+    const row = await ctx.db
+      .query('importanceCache')
+      .withIndex('text', (q) => q.eq('textHash', args.textHash))
+      .first();
+    return row ? row.importance : null;
+  },
+});
+
+export const setCachedImportance = internalMutation({
+  args: { textHash: v.bytes(), importance: v.number() },
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query('importanceCache')
+      .withIndex('text', (q) => q.eq('textHash', args.textHash))
+      .first();
+    if (!existing) {
+      await ctx.db.insert('importanceCache', {
+        textHash: args.textHash,
+        importance: args.importance,
+      });
+    }
+  },
+});
 
 const { embeddingId: _embeddingId, ...memoryFieldsWithoutEmbeddingId } = memoryFields;
 
@@ -327,74 +430,99 @@ async function reflectOnMemories(
   worldId: Id<'worlds'>,
   playerId: GameId<'players'>,
 ) {
+  const cfg = reflectionCfg();
   const { memories, lastReflectionTs, name } = await ctx.runQuery(
     internal.agent.memory.getReflectionMemories,
     {
       worldId,
       playerId,
-      numberOfItems: 100,
+      numberOfItems: cfg.recentWindow,
     },
   );
 
-  // should only reflect if lastest 100 items have importance score of >500
+  // Trigger only when accumulated importance since the last reflection crosses
+  // the (configurable) threshold.
   const sumOfImportanceScore = memories
     .filter((m) => m._creationTime > (lastReflectionTs ?? 0))
     .reduce((acc, curr) => acc + curr.importance, 0);
-  const shouldReflect = sumOfImportanceScore > 500;
-
-  if (!shouldReflect) {
+  if (sumOfImportanceScore <= cfg.importanceThreshold) {
     return false;
   }
-  console.debug('sum of importance score = ', sumOfImportanceScore);
-  console.debug('Reflecting...');
-  const prompt = ['[no prose]', '[Output only JSON]', `You are ${name}, statements about you:`];
-  memories.forEach((m, idx) => {
-    prompt.push(`Statement ${idx}: ${m.description}`);
-  });
-  prompt.push('What 3 high-level insights can you infer from the above statements?');
-  prompt.push(
-    'Return in JSON format, where the key is a list of input statements that contributed to your insights and value is your insight. Make the response parseable by Typescript JSON.parse() function. DO NOT escape characters or include "\n" or white space in response.',
-  );
-  prompt.push(
-    'Example: [{insight: "...", statementIds: [1,2]}, {insight: "...", statementIds: [1]}, ...]',
-  );
+  console.debug(`Reflecting (importance ${sumOfImportanceScore} > ${cfg.importanceThreshold})...`);
 
-  const { content: reflection } = await chatCompletion({
-    messages: [
-      {
-        role: 'user',
-        content: prompt.join('\n'),
-      },
-    ],
+  // Step 1 (Stanford §4.3): ask for the few most salient questions about the
+  // recent memories.
+  const qPrompt = [
+    '[Output only JSON]',
+    `You are ${name}. Recent statements about your life:`,
+    ...memories.map((m, idx) => `Statement ${idx}: ${m.description}`),
+    `Given only the above, what are the ${cfg.numQuestions} most salient high-level questions you could ask about the subjects in the statements?`,
+    'Return a JSON array of question strings, e.g. ["...", "..."]. JSON only.',
+  ].join('\n');
+  const { content: qRaw } = await chatCompletion({
+    messages: [{ role: 'user', content: qPrompt }],
+    max_tokens: 400,
   });
-
+  let questions: string[];
   try {
-    // The OpenAI-compat layer ignores `strict`, so reflection JSON can arrive
-    // wrapped in prose/```json fences. Parse defensively.
-    const insights = extractJSON<{ insight: string; statementIds: number[] }[]>(reflection);
-    const memoriesToSave = await asyncMap(insights, async (item) => {
-      const relatedMemoryIds = item.statementIds.map((idx: number) => memories[idx]._id);
-      const importance = await calculateImportance(item.insight);
-      const { embedding } = await fetchEmbedding(item.insight);
-      console.debug('adding reflection memory...', item.insight);
-      return {
-        description: item.insight,
-        embedding,
-        importance,
-        relatedMemoryIds,
-      };
-    });
-
-    await ctx.runMutation(selfInternal.insertReflectionMemories, {
-      worldId,
-      playerId,
-      reflections: memoriesToSave,
-    });
+    questions = extractJSON<string[]>(qRaw).filter((q) => typeof q === 'string');
   } catch (e) {
-    console.error('error saving or parsing reflection', e);
-    console.debug('reflection', reflection);
-    return false;
+    console.error('could not parse reflection questions; using a default', e);
+    questions = ['What are the most important things I should reflect on right now?'];
   }
+  questions = questions.slice(0, cfg.numQuestions);
+
+  // Step 2: for each question, retrieve relevant memories (three-factor
+  // retrieval, which itself includes prior reflections -> the tree), then
+  // synthesize higher-level insights tagged with their supporting evidence.
+  const reflectionsToSave: {
+    description: string;
+    embedding: number[];
+    importance: number;
+    relatedMemoryIds: Id<'memories'>[];
+  }[] = [];
+
+  for (const question of questions) {
+    const { embedding: qEmbedding } = await fetchEmbedding(question);
+    const relevant = await searchMemories(ctx, playerId, qEmbedding, cfg.memoriesPerQuestion);
+    if (relevant.length === 0) continue;
+
+    const sPrompt = [
+      '[Output only JSON]',
+      `You are ${name}. Question: ${question}`,
+      'Relevant statements from your memory:',
+      ...relevant.map((m, idx) => `Statement ${idx}: ${m.description}`),
+      `What ${cfg.insightsPerQuestion} high-level insight(s) can you infer to answer the question?`,
+      'Return JSON: [{"insight":"...","statementIds":[0,1]}]. statementIds index the statements above. JSON only.',
+    ].join('\n');
+    const { content: sRaw } = await chatCompletion({
+      messages: [{ role: 'user', content: sPrompt }],
+      max_tokens: 600,
+    });
+    let insights: { insight: string; statementIds: number[] }[];
+    try {
+      insights = extractJSON<{ insight: string; statementIds: number[] }[]>(sRaw);
+    } catch (e) {
+      console.error('could not parse reflection insights for a question; skipping', e);
+      continue;
+    }
+    for (const item of insights.slice(0, cfg.insightsPerQuestion)) {
+      if (!item || typeof item.insight !== 'string') continue;
+      const relatedMemoryIds = (item.statementIds ?? [])
+        .map((idx) => relevant[idx]?._id)
+        .filter((id): id is Id<'memories'> => !!id);
+      const importance = await calculateImportance(ctx, item.insight);
+      const { embedding } = await fetchEmbedding(item.insight);
+      reflectionsToSave.push({ description: item.insight, embedding, importance, relatedMemoryIds });
+    }
+  }
+
+  if (reflectionsToSave.length === 0) return false;
+  await ctx.runMutation(selfInternal.insertReflectionMemories, {
+    worldId,
+    playerId,
+    reflections: reflectionsToSave,
+  });
   return true;
 }
 export const getReflectionMemories = internalQuery({
