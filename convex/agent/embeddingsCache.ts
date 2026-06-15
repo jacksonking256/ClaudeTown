@@ -34,11 +34,17 @@ export async function fetchBatch(ctx: ActionCtx, texts: string[]) {
     }
     for (let i = 0; i < missingIndexes.length; i++) {
       const resultIndex = missingIndexes[i];
-      toWrite.push({
-        textHash: textHashes[resultIndex],
-        embedding: response.embeddings[i],
-      });
-      results[resultIndex] = response.embeddings[i];
+      const embedding = response.embeddings[i];
+      results[resultIndex] = embedding;
+      // Never cache an empty embedding: the backend (e.g. Ollama mid-pull) can
+      // briefly return [], and a cached empty vector would poison this text
+      // forever and crash vectorSearch. Leave it uncached so it retries later.
+      if (embedding && embedding.length > 0) {
+        toWrite.push({
+          textHash: textHashes[resultIndex],
+          embedding,
+        });
+      }
     }
   }
   if (toWrite.length > 0) {
@@ -79,7 +85,9 @@ export const getEmbeddingsByText = internalQuery({
         .query('embeddingsCache')
         .withIndex('text', (q) => q.eq('textHash', textHash))
         .first();
-      if (result) {
+      // Treat an empty cached embedding as a miss so previously-poisoned entries
+      // (cached as [] while the backend was warming up) self-heal on refetch.
+      if (result && result.embedding.length > 0) {
         out.push({
           index: i,
           embeddingId: result._id,
