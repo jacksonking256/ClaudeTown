@@ -28,9 +28,8 @@ const OLLAMA_EMBEDDING_DIMENSION = 1024; // mxbai-embed-large
 
 // The vector index in convex/agent/schema.ts is built with this dimension, so
 // it must match the embedding model's output. Changing it requires a schema
-// redeploy. Override with EMBEDDING_DIMENSION only if you also change the model.
-export const EMBEDDING_DIMENSION: number =
-  Number(process.env.EMBEDDING_DIMENSION) || OLLAMA_EMBEDDING_DIMENSION;
+// redeploy.
+export const EMBEDDING_DIMENSION: number = OLLAMA_EMBEDDING_DIMENSION;
 
 export type ChatProvider = 'anthropic' | 'openai' | 'together' | 'ollama' | 'custom';
 export type EmbeddingProvider = 'ollama' | 'openai' | 'together' | 'custom';
