@@ -328,7 +328,17 @@ export async function chatCompletion(
     if (body.stream) {
       return new ChatCompletionContent(result.body!, stopWords);
     } else {
-      const json = (await result.json()) as CreateChatCompletionResponse;
+      const text = await result.text();
+      let json: CreateChatCompletionResponse;
+      try {
+        json = JSON.parse(text) as CreateChatCompletionResponse;
+      } catch (e) {
+        throw new Error(
+          `Chat completion response invalid JSON (status ${result.status}): ${
+            e instanceof Error ? e.message : String(e)
+          }\nresponse body:\n${text}`,
+        );
+      }
       const content = json.choices[0].message?.content;
       if (content === undefined) {
         throw new Error('Unexpected result from OpenAI: ' + JSON.stringify(json));
@@ -420,13 +430,25 @@ export async function fetchEmbeddingBatch(texts: string[]) {
         input: texts.map((text) => text.replace(/\n/g, ' ')),
       }),
     });
+    const text = await result.text();
     if (!result.ok) {
       throw {
         retry: result.status === 429 || result.status >= 500,
-        error: new Error(`Embedding failed with code ${result.status}: ${await result.text()}`),
+        error: new Error(`Embedding failed with code ${result.status}: ${text}`),
       };
     }
-    return (await result.json()) as CreateEmbeddingResponse;
+    try {
+      return JSON.parse(text) as CreateEmbeddingResponse;
+    } catch (e) {
+      throw {
+        retry: false,
+        error: new Error(
+          `Embedding response invalid JSON (status ${result.status}): ${
+            e instanceof Error ? e.message : String(e)
+          }\nresponse body:\n${text}`,
+        ),
+      };
+    }
   });
   if (json.data.length !== texts.length) {
     console.error(json);
@@ -940,14 +962,36 @@ export async function ollamaFetchEmbedding(text: string) {
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ model: config.embeddingModel, prompt: text }),
+      body: JSON.stringify({ model: config.embeddingModel, input: text }),
     });
-    if (resp.status === 404) {
-      const error = await resp.text();
-      await tryPullOllama(config.embeddingModel, error);
-      throw new Error(`Failed to fetch embeddings: ${resp.status}`);
+    const textBody = await resp.text();
+    if (!resp.ok) {
+      if (resp.status === 404) {
+        await tryPullOllama(config.embeddingModel, textBody);
+      }
+      throw {
+        retry: resp.status === 429 || resp.status >= 500,
+        error: new Error(
+          `Ollama embedding failed ${resp.status} ${resp.statusText} at ${config.url}/api/embeddings: ${textBody}`,
+        ),
+      };
     }
-    return (await resp.json()).embedding as number[];
+    try {
+      const json = JSON.parse(textBody) as { embedding: number[] };
+      if (!Array.isArray(json.embedding)) {
+        throw new Error(`Invalid embedding response shape: ${textBody}`);
+      }
+      return json.embedding;
+    } catch (e) {
+      throw {
+        retry: false,
+        error: new Error(
+          `Ollama embedding response invalid JSON: ${
+            e instanceof Error ? e.message : String(e)
+          }\nresponse body:\n${textBody}`,
+        ),
+      };
+    }
   });
   return { embedding: result };
 }
