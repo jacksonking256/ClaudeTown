@@ -1,7 +1,7 @@
 import { v } from 'convex/values';
 import { internalAction } from '../_generated/server';
 import { WorldMap, serializedWorldMap } from './worldMap';
-import { rememberConversation } from '../agent/memory';
+import { rememberConversation, currentPlannedActivity } from '../agent/memory';
 import { GameId, agentId, conversationId, playerId } from './ids';
 import {
   continueConversationMessage,
@@ -125,8 +125,29 @@ export const agentDoSomething = internalAction({
         });
         return;
       } else {
-        // TODO: have LLM choose the activity & emoji
-        const activity = ACTIVITIES[Math.floor(Math.random() * ACTIVITIES.length)];
+        // Plan-driven activity (hierarchical planning): do what this time-of-day
+        // block in the agent's plan says. Falls back to a random activity if
+        // planning is disabled or no block covers the current time.
+        let description: string;
+        let emoji: string;
+        let durationMs: number;
+        const planned = await currentPlannedActivity(
+          ctx,
+          args.worldId,
+          agent.playerId as GameId<'players'>,
+        );
+        if (planned) {
+          description = planned.description;
+          emoji = planned.emoji ?? '🧭';
+          // Re-evaluate at least every few minutes so behavior stays lively and
+          // the agent can react to its surroundings.
+          durationMs = Math.min(planned.durationMinutes * 60_000, 5 * 60_000);
+        } else {
+          const activity = ACTIVITIES[Math.floor(Math.random() * ACTIVITIES.length)];
+          description = activity.description;
+          emoji = activity.emoji;
+          durationMs = activity.duration;
+        }
         await sleep(Math.random() * 1000);
         await ctx.runMutation(api.aiTown.main.sendInput, {
           worldId: args.worldId,
@@ -135,9 +156,9 @@ export const agentDoSomething = internalAction({
             operationId: args.operationId,
             agentId: agent.id,
             activity: {
-              description: activity.description,
-              emoji: activity.emoji,
-              until: Date.now() + activity.duration,
+              description,
+              emoji,
+              until: Date.now() + durationMs,
             },
           },
         });

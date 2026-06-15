@@ -42,6 +42,7 @@ export const memoryFields = {
       // Minutes from midnight in simulated local time.
       startMinute: v.optional(v.number()),
       endMinute: v.optional(v.number()),
+      emoji: v.optional(v.string()),
       status: v.optional(
         v.union(
           v.literal('pending'),
@@ -94,4 +95,14 @@ export const agentTables = {
     restatement: v.string(),
     similarity: v.number(),
   }).index('playerId', ['playerId']),
+  // Per-agent, per-day plan control record. The timed blocks live in the memory
+  // stream (data.type === 'plan'); this row holds the day's agenda and the
+  // replan counter that enforces the cost cap on reactive replanning.
+  planMeta: defineTable({
+    worldId: v.id('worlds'),
+    playerId,
+    planId: v.string(),
+    agenda: v.string(),
+    replans: v.number(),
+  }).index('playerId_planId', ['playerId', 'planId']),
 };

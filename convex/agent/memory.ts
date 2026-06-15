@@ -22,8 +22,10 @@ import {
   IMPORTANCE_MAX,
   reflection as reflectionCfg,
   identity as identityCfg,
+  planning as planningCfg,
 } from './cognitionConfig';
 import { buildIdentityAnchor, cosineSimilarity, restatementPrompt } from './identity';
+import * as planning from './planning';
 
 // How long to wait before updating a memory's last access time.
 export const MEMORY_ACCESS_THROTTLE = 300_000; // In ms
@@ -102,6 +104,9 @@ export async function rememberConversation(
   // Persona-coherence check (rate-limited internally). Piggybacks on the
   // post-conversation cadence so no engine-tick surgery is needed.
   await maybeRunIdentityCoherenceCheck(ctx, worldId, playerId);
+  // Treat the conversation summary as an observation: if it's significant
+  // enough it may contradict the day's plan -> cost-capped reactive replan.
+  await maybeReactivelyReplan(ctx, worldId, playerId, importance);
   return description;
 }
 
@@ -704,4 +709,298 @@ export async function maybeRunIdentityCoherenceCheck(
     similarity,
   });
   return { restatement, similarity };
+}
+
+// ---------------------------------------------------------------------------
+// Hierarchical planning + reactive replanning (Stanford §4.4).
+// ---------------------------------------------------------------------------
+
+// Reads the day's plan-control row + the timed block memories for `planId`.
+export const getPlanState = internalQuery({
+  args: { playerId, planId: v.string() },
+  handler: async (ctx, args) => {
+    const meta = await ctx.db
+      .query('planMeta')
+      .withIndex('playerId_planId', (q) =>
+        q.eq('playerId', args.playerId).eq('planId', args.planId),
+      )
+      .first();
+    const planMemories = await ctx.db
+      .query('memories')
+      .withIndex('playerId_type', (q) => q.eq('playerId', args.playerId).eq('data.type', 'plan'))
+      .collect();
+    const blocks = planMemories
+      .flatMap((m) => {
+        if (m.data.type !== 'plan' || m.data.planId !== args.planId || m.data.level !== 'block') {
+          return [];
+        }
+        return [
+          {
+            memoryId: m._id,
+            startMinute: m.data.startMinute ?? 0,
+            endMinute: m.data.endMinute ?? 0,
+            description: m.description,
+            emoji: m.data.emoji,
+          },
+        ];
+      })
+      .sort((a, b) => a.startMinute - b.startMinute);
+    return {
+      meta: meta ? { replans: meta.replans, agenda: meta.agenda } : null,
+      blocks,
+    };
+  },
+});
+
+// Public query for the debug panel: today's agenda + remaining blocks.
+export const latestPlan = query({
+  args: { playerId },
+  handler: async (ctx, args) => {
+    const planId = planning.planIdForDate(new Date());
+    const meta = await ctx.db
+      .query('planMeta')
+      .withIndex('playerId_planId', (q) => q.eq('playerId', args.playerId).eq('planId', planId))
+      .first();
+    if (!meta) return null;
+    const planMemories = await ctx.db
+      .query('memories')
+      .withIndex('playerId_type', (q) => q.eq('playerId', args.playerId).eq('data.type', 'plan'))
+      .collect();
+    const blocks = planMemories
+      .flatMap((m) =>
+        m.data.type === 'plan' && m.data.planId === planId && m.data.level === 'block'
+          ? [
+              {
+                start: planning.minutesToHHMM(m.data.startMinute ?? 0),
+                end: planning.minutesToHHMM(m.data.endMinute ?? 0),
+                description: m.description,
+                emoji: m.data.emoji,
+              },
+            ]
+          : [],
+      )
+      .sort((a, b) => (a.start < b.start ? -1 : 1));
+    return { planId, agenda: meta.agenda, replans: meta.replans, blocks };
+  },
+});
+
+export const savePlan = internalMutation({
+  args: {
+    worldId: v.id('worlds'),
+    playerId,
+    planId: v.string(),
+    agenda: v.string(),
+    agendaEmbedding: v.array(v.float64()),
+    isReplan: v.boolean(),
+    fromMinute: v.optional(v.number()),
+    blocks: v.array(
+      v.object({
+        startMinute: v.number(),
+        endMinute: v.number(),
+        description: v.string(),
+        emoji: v.optional(v.string()),
+        embedding: v.array(v.float64()),
+      }),
+    ),
+  },
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query('planMeta')
+      .withIndex('playerId_planId', (q) =>
+        q.eq('playerId', args.playerId).eq('planId', args.planId),
+      )
+      .first();
+    if (existing) {
+      await ctx.db.patch(existing._id, {
+        agenda: args.agenda,
+        replans: existing.replans + (args.isReplan ? 1 : 0),
+      });
+    } else {
+      await ctx.db.insert('planMeta', {
+        worldId: args.worldId,
+        playerId: args.playerId,
+        planId: args.planId,
+        agenda: args.agenda,
+        replans: 0,
+      });
+    }
+
+    // On a replan, drop the block memories from `fromMinute` forward so the new
+    // ones replace them (the past is left as-is).
+    if (args.isReplan && args.fromMinute !== undefined) {
+      const planMemories = await ctx.db
+        .query('memories')
+        .withIndex('playerId_type', (q) =>
+          q.eq('playerId', args.playerId).eq('data.type', 'plan'),
+        )
+        .collect();
+      for (const m of planMemories) {
+        if (
+          m.data.type === 'plan' &&
+          m.data.planId === args.planId &&
+          m.data.level === 'block' &&
+          (m.data.endMinute ?? 0) > args.fromMinute
+        ) {
+          await ctx.db.delete(m.embeddingId);
+          await ctx.db.delete(m._id);
+        }
+      }
+    }
+
+    const ts = Date.now();
+    // Day-level memory only on first generation (keeps the stream from filling
+    // with duplicate agendas on replan).
+    if (!args.isReplan) {
+      const dayEmbeddingId = await ctx.db.insert('memoryEmbeddings', {
+        playerId: args.playerId,
+        embedding: args.agendaEmbedding,
+      });
+      await ctx.db.insert('memories', {
+        playerId: args.playerId,
+        description: args.agenda,
+        embeddingId: dayEmbeddingId,
+        importance: 5,
+        lastAccess: ts,
+        data: { type: 'plan', planId: args.planId, level: 'day' },
+      });
+    }
+    for (const b of args.blocks) {
+      const embeddingId = await ctx.db.insert('memoryEmbeddings', {
+        playerId: args.playerId,
+        embedding: b.embedding,
+      });
+      await ctx.db.insert('memories', {
+        playerId: args.playerId,
+        description: b.description,
+        embeddingId,
+        importance: 3,
+        lastAccess: ts,
+        data: {
+          type: 'plan',
+          planId: args.planId,
+          level: 'block',
+          startMinute: b.startMinute,
+          endMinute: b.endMinute,
+          emoji: b.emoji,
+          status: 'pending',
+        },
+      });
+    }
+  },
+});
+
+// LLM orchestration: generate (or replan) the day's schedule. fromMinute set =>
+// reactive replan that only rewrites the remainder of the day.
+async function generatePlan(
+  ctx: ActionCtx,
+  worldId: Id<'worlds'>,
+  playerId: GameId<'players'>,
+  planId: string,
+  fromMinute?: number,
+): Promise<planning.PlanBlock[]> {
+  const cfg = planningCfg();
+  const id = await ctx.runQuery(selfInternal.loadIdentity, { worldId, playerId });
+  if (!id) return [];
+  const anchor = buildIdentityAnchor(id);
+
+  const { content: agenda } = await chatCompletion({
+    messages: [{ role: 'user', content: planning.dailyAgendaPrompt(anchor, id.name, planId) }],
+    max_tokens: 300,
+  });
+  const { content: scheduleRaw } = await chatCompletion({
+    messages: [
+      { role: 'user', content: planning.schedulePrompt(anchor, id.name, agenda, cfg.blockMinutes) },
+    ],
+    max_tokens: 1200,
+  });
+  let blocks: planning.PlanBlock[];
+  try {
+    blocks = planning.parseSchedule(extractJSON(scheduleRaw));
+  } catch (e) {
+    console.error('[planning] could not parse schedule', e);
+    return [];
+  }
+  if (fromMinute !== undefined) {
+    blocks = blocks.filter((b) => b.endMinute > fromMinute);
+  }
+  if (blocks.length === 0) return [];
+
+  const agendaEmbedding = (await fetchEmbedding(agenda)).embedding;
+  const withEmbeddings = await asyncMap(blocks, async (b) => ({
+    ...b,
+    embedding: (await fetchEmbedding(b.description)).embedding,
+  }));
+  await ctx.runMutation(selfInternal.savePlan, {
+    worldId,
+    playerId,
+    planId,
+    agenda,
+    agendaEmbedding,
+    isReplan: fromMinute !== undefined,
+    fromMinute,
+    blocks: withEmbeddings,
+  });
+  return blocks;
+}
+
+// Ensure today's plan exists (generate once per simulated morning), returning
+// its blocks.
+export async function ensureDayPlan(
+  ctx: ActionCtx,
+  worldId: Id<'worlds'>,
+  playerId: GameId<'players'>,
+): Promise<planning.PlanBlock[]> {
+  if (!planningCfg().enabled) return [];
+  const planId = planning.planIdForDate(new Date());
+  const state = await ctx.runQuery(selfInternal.getPlanState, { playerId, planId });
+  if (state.blocks.length > 0) {
+    return state.blocks.map((b) => ({
+      startMinute: b.startMinute,
+      endMinute: b.endMinute,
+      description: b.description,
+      emoji: b.emoji,
+    }));
+  }
+  return await generatePlan(ctx, worldId, playerId, planId);
+}
+
+// The activity the agent should currently be doing per its plan, if any.
+export async function currentPlannedActivity(
+  ctx: ActionCtx,
+  worldId: Id<'worlds'>,
+  playerId: GameId<'players'>,
+): Promise<{ description: string; emoji?: string; durationMinutes: number } | null> {
+  const blocks = await ensureDayPlan(ctx, worldId, playerId);
+  if (blocks.length === 0) return null;
+  const nowMinute = planning.minutesOfDay(new Date());
+  const block = planning.currentBlock(blocks, nowMinute);
+  if (!block) return null;
+  const durationMinutes = Math.max(1, block.endMinute - Math.max(nowMinute, block.startMinute));
+  return { description: block.description, emoji: block.emoji, durationMinutes };
+}
+
+// Reactive replanning, cost-capped: only when the observation is significant
+// enough AND the per-day replan budget isn't exhausted.
+export async function maybeReactivelyReplan(
+  ctx: ActionCtx,
+  worldId: Id<'worlds'>,
+  playerId: GameId<'players'>,
+  observationImportance: number,
+): Promise<boolean> {
+  const cfg = planningCfg();
+  if (!cfg.enabled) return false;
+  if (observationImportance < cfg.replanMinImportance) return false;
+  const planId = planning.planIdForDate(new Date());
+  const state = await ctx.runQuery(selfInternal.getPlanState, { playerId, planId });
+  // Nothing to contradict if there's no plan yet today.
+  if (!state.meta) return false;
+  if (state.meta.replans >= cfg.replanMaxPerDay) return false;
+  const nowMinute = planning.minutesOfDay(new Date());
+  console.debug(
+    `[planning] reactive replan for ${playerId} (importance ${observationImportance}, replan #${
+      state.meta.replans + 1
+    })`,
+  );
+  const blocks = await generatePlan(ctx, worldId, playerId, planId, nowMinute);
+  return blocks.length > 0;
 }
