@@ -85,10 +85,24 @@ export function schedulePrompt(
     `${name}'s broad plan for today:`,
     agenda,
     '',
-    `Break this into a concrete daily schedule of timed activities (roughly ${blockMinutes}-minute`,
-    `granularity where it makes sense, coarser when idle). Cover waking hours.`,
-    `Return ONLY JSON: an array of {"start":"HH:MM","end":"HH:MM","activity":"...","emoji":"X"}.`,
-    `Times are 24-hour local. Keep activities short and concrete. JSON only.`,
+    `Break this into a concrete daily schedule of timed activities covering waking`,
+    `hours (roughly ${blockMinutes}-minute granularity where it makes sense,`,
+    `coarser when idle). Use 8-16 entries total. Keep each activity short and concrete.`,
+    '',
+    `Respond with ONLY a JSON array and nothing else — no prose, no explanation, no`,
+    `markdown fences. Start your reply with "[" and end with "]". Each element:`,
+    `{"start":"HH:MM","end":"HH:MM","activity":"short phrase","emoji":"single emoji"}`,
+    `Times are 24-hour local. Example:`,
+    `[{"start":"07:00","end":"07:30","activity":"wake up and stretch","emoji":"🛌"},` +
+      `{"start":"07:30","end":"08:15","activity":"make breakfast","emoji":"🍳"}]`,
+  ].join('\n');
+}
+
+// A terse retry used when the first schedule reply wasn't parseable JSON.
+export function scheduleRetryPrompt(): string {
+  return [
+    'That was not valid JSON. Reply again with ONLY the JSON array, starting with',
+    '"[" and ending with "]". No prose, no markdown fences.',
   ].join('\n');
 }
 
