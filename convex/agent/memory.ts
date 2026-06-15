@@ -2,7 +2,7 @@ import { v } from 'convex/values';
 import { ActionCtx, DatabaseReader, internalMutation, internalQuery } from '../_generated/server';
 import { Doc, Id } from '../_generated/dataModel';
 import { internal } from '../_generated/api';
-import { LLMMessage, chatCompletion, fetchEmbedding } from '../util/llm';
+import { LLMMessage, chatCompletion, extractJSON, fetchEmbedding } from '../util/llm';
 import { asyncMap } from '../util/asyncMap';
 import { GameId, agentId, conversationId, playerId } from '../aiTown/ids';
 import { SerializedPlayer } from '../aiTown/player';
@@ -369,7 +369,9 @@ async function reflectOnMemories(
   });
 
   try {
-    const insights = JSON.parse(reflection) as { insight: string; statementIds: number[] }[];
+    // The OpenAI-compat layer ignores `strict`, so reflection JSON can arrive
+    // wrapped in prose/```json fences. Parse defensively.
+    const insights = extractJSON<{ insight: string; statementIds: number[] }[]>(reflection);
     const memoriesToSave = await asyncMap(insights, async (item) => {
       const relatedMemoryIds = item.statementIds.map((idx: number) => memories[idx]._id);
       const importance = await calculateImportance(item.insight);
