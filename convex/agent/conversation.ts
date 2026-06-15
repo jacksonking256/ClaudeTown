@@ -7,6 +7,8 @@ import { api, internal } from '../_generated/api';
 import * as embeddingsCache from './embeddingsCache';
 import { GameId, conversationId, playerId } from '../aiTown/ids';
 import { NUM_MEMORIES_TO_SEARCH } from '../constants';
+import { buildIdentityAnchor, identityPromptLines } from './identity';
+import { identity as identityCfg } from './cognitionConfig';
 
 const selfInternal = internal.agent.conversation;
 
@@ -182,14 +184,29 @@ export async function leaveConversationMessage(
   return trimContentPrefx(content, lastPrompt);
 }
 
+type PromptAgent = {
+  name?: string;
+  identity: string;
+  plan: string;
+  values?: string;
+  relationships?: string;
+  longTermGoal?: string;
+};
+
 function agentPrompts(
   otherPlayer: { name: string },
-  agent: { identity: string; plan: string } | null,
+  agent: PromptAgent | null,
   otherAgent: { identity: string; plan: string } | null,
 ): string[] {
   const prompt = [];
   if (agent) {
-    prompt.push(`About you: ${agent.identity}`);
+    // Identity anchoring: inject the always-available persona summary (core
+    // self, values, relationships, long-term goal) on every cognition step.
+    if (identityCfg().inject) {
+      prompt.push(...identityPromptLines(buildIdentityAnchor(agent)));
+    } else {
+      prompt.push(`About you: ${agent.identity}`);
+    }
     prompt.push(`Your goals for the conversation: ${agent.plan}`);
   }
   if (otherAgent) {
@@ -334,7 +351,15 @@ export const queryPromptData = internalQuery({
       player: { name: playerDescription.name, ...player },
       otherPlayer: { name: otherPlayerDescription.name, ...otherPlayer },
       conversation,
-      agent: { identity: agentDescription.identity, plan: agentDescription.plan, ...agent },
+      agent: {
+        name: playerDescription.name,
+        identity: agentDescription.identity,
+        plan: agentDescription.plan,
+        values: agentDescription.values,
+        relationships: agentDescription.relationships,
+        longTermGoal: agentDescription.longTermGoal,
+        ...agent,
+      },
       otherAgent: otherAgent && {
         identity: otherAgentDescription!.identity,
         plan: otherAgentDescription!.plan,

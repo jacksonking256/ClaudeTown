@@ -1,5 +1,11 @@
 import { v } from 'convex/values';
-import { ActionCtx, DatabaseReader, internalMutation, internalQuery } from '../_generated/server';
+import {
+  ActionCtx,
+  DatabaseReader,
+  internalMutation,
+  internalQuery,
+  query,
+} from '../_generated/server';
 import { Doc, Id } from '../_generated/dataModel';
 import { internal } from '../_generated/api';
 import { LLMMessage, chatCompletion, extractJSON, fetchEmbedding } from '../util/llm';
@@ -15,7 +21,9 @@ import {
   IMPORTANCE_MIN,
   IMPORTANCE_MAX,
   reflection as reflectionCfg,
+  identity as identityCfg,
 } from './cognitionConfig';
+import { buildIdentityAnchor, cosineSimilarity, restatementPrompt } from './identity';
 
 // How long to wait before updating a memory's last access time.
 export const MEMORY_ACCESS_THROTTLE = 300_000; // In ms
@@ -91,6 +99,9 @@ export async function rememberConversation(
     embedding,
   });
   await reflectOnMemories(ctx, worldId, playerId);
+  // Persona-coherence check (rate-limited internally). Piggybacks on the
+  // post-conversation cadence so no engine-tick surgery is needed.
+  await maybeRunIdentityCoherenceCheck(ctx, worldId, playerId);
   return description;
 }
 
@@ -577,4 +588,120 @@ export async function latestMemoryOfType<T extends MemoryType>(
     .first();
   if (!entry) return null;
   return entry as MemoryOfType<T>;
+}
+
+// ---------------------------------------------------------------------------
+// Identity anchoring (Stanford/Concordia-inspired persona coherence).
+// ---------------------------------------------------------------------------
+
+// Loads the persona anchor fields + the timestamp of the last coherence check.
+export const loadIdentity = internalQuery({
+  args: { worldId: v.id('worlds'), playerId },
+  handler: async (ctx, args) => {
+    const world = await ctx.db.get(args.worldId);
+    if (!world) return null;
+    const agent = world.agents.find((a) => a.playerId === args.playerId);
+    if (!agent) return null;
+    const agentDescription = await ctx.db
+      .query('agentDescriptions')
+      .withIndex('worldId', (q) => q.eq('worldId', args.worldId).eq('agentId', agent.id))
+      .first();
+    if (!agentDescription) return null;
+    const playerDescription = await ctx.db
+      .query('playerDescriptions')
+      .withIndex('worldId', (q) => q.eq('worldId', args.worldId).eq('playerId', args.playerId))
+      .first();
+    const lastCheck = await ctx.db
+      .query('identityChecks')
+      .withIndex('playerId', (q) => q.eq('playerId', args.playerId))
+      .order('desc')
+      .first();
+    return {
+      name: playerDescription?.name ?? 'Someone',
+      identity: agentDescription.identity,
+      plan: agentDescription.plan,
+      values: agentDescription.values,
+      relationships: agentDescription.relationships,
+      longTermGoal: agentDescription.longTermGoal,
+      lastCheckTs: lastCheck?._creationTime,
+    };
+  },
+});
+
+export const recordIdentityCheck = internalMutation({
+  args: {
+    worldId: v.id('worlds'),
+    playerId,
+    anchor: v.string(),
+    restatement: v.string(),
+    similarity: v.number(),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.insert('identityChecks', {
+      worldId: args.worldId,
+      playerId: args.playerId,
+      anchor: args.anchor,
+      restatement: args.restatement,
+      similarity: args.similarity,
+    });
+  },
+});
+
+// Public query for the debug panel: latest coherence check for a player.
+export const latestIdentityCheck = query({
+  args: { worldId: v.id('worlds'), playerId },
+  handler: async (ctx, args) => {
+    const row = await ctx.db
+      .query('identityChecks')
+      .withIndex('playerId', (q) => q.eq('playerId', args.playerId))
+      .order('desc')
+      .first();
+    if (!row) return null;
+    return {
+      anchor: row.anchor,
+      restatement: row.restatement,
+      similarity: row.similarity,
+      // Drift in [0, ~2]; 0 = perfectly on-persona.
+      drift: 1 - row.similarity,
+      ts: row._creationTime,
+    };
+  },
+});
+
+// Restate-and-measure: ask the agent who it is, embed the restatement, and
+// record cosine similarity to the anchor. Rate-limited by config interval.
+export async function maybeRunIdentityCoherenceCheck(
+  ctx: ActionCtx,
+  worldId: Id<'worlds'>,
+  playerId: GameId<'players'>,
+): Promise<{ restatement: string; similarity: number } | null> {
+  const cfg = identityCfg();
+  if (!cfg.coherenceCheckEnabled) return null;
+  const data = await ctx.runQuery(selfInternal.loadIdentity, { worldId, playerId });
+  if (!data) return null;
+  if (data.lastCheckTs && Date.now() - data.lastCheckTs < cfg.coherenceIntervalMs) {
+    return null;
+  }
+  const anchor = buildIdentityAnchor(data);
+  const { content: restatement } = await chatCompletion({
+    messages: [
+      { role: 'system', content: anchor },
+      { role: 'user', content: restatementPrompt(data.name) },
+    ],
+    max_tokens: 200,
+  });
+  const [anchorEmb, restateEmb] = await Promise.all([
+    fetchEmbedding(anchor),
+    fetchEmbedding(restatement),
+  ]);
+  const similarity = cosineSimilarity(anchorEmb.embedding, restateEmb.embedding);
+  console.debug(`[identity] ${data.name} coherence similarity=${similarity.toFixed(3)}`);
+  await ctx.runMutation(selfInternal.recordIdentityCheck, {
+    worldId,
+    playerId,
+    anchor,
+    restatement,
+    similarity,
+  });
+  return { restatement, similarity };
 }

@@ -85,4 +85,13 @@ export const agentTables = {
     textHash: v.bytes(),
     importance: v.number(),
   }).index('text', ['textHash']),
+  // Periodic persona-coherence checks: the agent restates its core identity and
+  // we record cosine similarity to the anchor so drift is visible (not assumed).
+  identityChecks: defineTable({
+    worldId: v.id('worlds'),
+    playerId,
+    anchor: v.string(),
+    restatement: v.string(),
+    similarity: v.number(),
+  }).index('playerId', ['playerId']),
 };
