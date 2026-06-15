@@ -186,6 +186,13 @@ export async function searchMemories(
   searchEmbedding: number[],
   n: number = 3,
 ) {
+  // Guard against a missing/empty query vector (embeddings backend not ready,
+  // e.g. Ollama still pulling its model). vectorSearch throws on an empty array,
+  // which would crash the whole operation; degrade to "no memories" instead.
+  if (!searchEmbedding || searchEmbedding.length === 0) {
+    console.warn('[memory] empty search embedding; skipping retrieval this step');
+    return [];
+  }
   const candidates = await ctx.vectorSearch('memoryEmbeddings', 'embedding', {
     vector: searchEmbedding,
     filter: (q) => q.eq('playerId', playerId),
